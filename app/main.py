@@ -7,7 +7,7 @@ from contextlib import asynccontextmanager
 from datetime import date
 from typing import List, Optional
 
-from fastapi import Depends, FastAPI, Query
+from fastapi import Depends, FastAPI, HTTPException, Query
 from sqlite3 import Connection
 
 from . import database as db
@@ -20,7 +20,14 @@ from .schemas import (
     RuleOut,
     SubmissionOut,
 )
-from .services import conflict_to_out, lookup_conversion, submit_batch
+from .services import (
+    SubmissionView,
+    conflict_to_out,
+    get_submission_view,
+    list_submissions_view,
+    lookup_conversion,
+    submit_batch,
+)
 from .validation import Conflict, PathInfo
 
 
@@ -147,27 +154,37 @@ def get_rules(item_code: str, conn: Connection = Depends(get_conn)) -> List[Rule
     ]
 
 
+def _submission_out(view: SubmissionView) -> SubmissionOut:
+    conflict = _conflict_from_row(view.conflict_json)
+    return SubmissionOut(
+        id=view.id,
+        item_code=view.item_code,
+        status=view.status,
+        determinable=view.determinable,
+        rule_codes=view.rule_codes,
+        raw_rule_codes=view.raw_rule_codes,
+        conflict=conflict_to_out(conflict) if conflict else None,
+        created_at=view.created_at,
+    )
+
+
 @app.get("/api/v1/submissions", response_model=List[SubmissionOut],
-         summary="查看送审批次记录（含退回原因）", tags=["规则报送"])
+         summary="查看送审批次历史（含退回原因；旧库批次自动还原编号）", tags=["规则报送"])
 def get_submissions(
     item_code: Optional[str] = Query(None, description="可选：按品项过滤"),
     conn: Connection = Depends(get_conn),
 ) -> List[SubmissionOut]:
-    rows = db.list_submissions(conn, item_code)
-    result: List[SubmissionOut] = []
-    for row in rows:
-        conflict = _conflict_from_row(row["conflict"])
-        result.append(
-            SubmissionOut(
-                id=row["id"],
-                item_code=row["item_code"],
-                status=row["status"],
-                rule_codes=row["rule_codes"].split(",") if row["rule_codes"] else [],
-                conflict=conflict_to_out(conflict) if conflict else None,
-                created_at=row["created_at"],
-            )
-        )
-    return result
+    return [_submission_out(v) for v in list_submissions_view(conn, item_code)]
+
+
+@app.get("/api/v1/submissions/{submission_id}", response_model=SubmissionOut,
+         summary="按批次号回查单个批次（旧库批次自动还原编号）", tags=["规则报送"])
+def get_submission(submission_id: int,
+                   conn: Connection = Depends(get_conn)) -> SubmissionOut:
+    view = get_submission_view(conn, submission_id)
+    if view is None:
+        raise HTTPException(status_code=404, detail=f"批次 {submission_id} 不存在")
+    return _submission_out(view)
 
 
 @app.get("/health", summary="健康检查", tags=["系统"])

@@ -27,6 +27,7 @@ def clean_db():
     conn = db.connect(_db_path)
     db.init_db(conn)
     conn.execute("DELETE FROM rules")
+    conn.execute("DELETE FROM submission_rules")
     conn.execute("DELETE FROM submissions")
     conn.execute("DELETE FROM sqlite_sequence")
     conn.commit()

@@ -92,6 +92,11 @@ class SubmissionOut(BaseModel):
     id: int
     item_code: str
     status: str
-    rule_codes: List[str]
+    determinable: bool = Field(
+        ..., description="规则编号是否可唯一确定（新批次始终为 true；旧库批次靠还原判定）")
+    rule_codes: Optional[List[str]] = Field(
+        None, description="可唯一确定时的完整规则编号（按报送顺序）；无法确定时为 null")
+    raw_rule_codes: Optional[str] = Field(
+        None, description="无法确定时附上的留存原文（逗号连接的原始存储串）")
     conflict: Optional[ConflictOut] = None
     created_at: str

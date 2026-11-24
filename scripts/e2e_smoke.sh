@@ -78,6 +78,29 @@ code=$(curl -s -o /dev/null -w '%{http_code}' "$BASE/docs")
 code=$(curl -s -o /dev/null -w '%{http_code}' "$BASE/openapi.json")
 [ "$code" = 200 ] && check "/openapi.json HTTP 200" 0 || check "/openapi.json ($code)" 1
 
+echo "== 8. 批次历史：含逗号编号精确回查（不拆开、不指到别批）=="
+ITEM3="E2E-H-${ITEM}"
+body=$(post "{\"item_code\":\"$ITEM3\",\"rules\":[
+ {\"rule_code\":\"D,1\",\"from_unit\":\"件\",\"to_unit\":\"盒\",\"from_amount\":1,\"to_amount\":8,\"start_date\":\"2026-01-01\",\"end_date\":\"2026-12-31\"},
+ {\"rule_code\":\"D2\",\"from_unit\":\"盒\",\"to_unit\":\"套\",\"from_amount\":1,\"to_amount\":6,\"start_date\":\"2026-01-01\",\"end_date\":\"2026-12-31\"}]}")
+sub_id=$(echo "$body" | python3 -c "import sys,json; print(json.load(sys.stdin)['submission_id'])")
+curl -s -G "$BASE/api/v1/submissions" --data-urlencode "item_code=$ITEM3" | tee /tmp/e2e_h1.json
+python3 -c "
+import json
+subs = json.load(open('/tmp/e2e_h1.json'))
+assert len(subs) == 1, subs
+s = subs[0]
+assert s['determinable'] is True, s
+assert s['rule_codes'] == ['D,1', 'D2'], s
+assert s['raw_rule_codes'] is None, s
+" && check "历史回查编号完整且按报送顺序" 0 || check "历史回查编号" 1
+curl -s "$BASE/api/v1/submissions/$sub_id" | tee /tmp/e2e_h2.json
+python3 -c "
+import json
+s = json.load(open('/tmp/e2e_h2.json'))
+assert s['determinable'] is True and s['rule_codes'] == ['D,1', 'D2'], s
+" && check "单批次回查编号完整" 0 || check "单批次回查" 1
+
 echo
 echo "结果: PASS=$pass FAIL=$fail"
 exit "$fail"

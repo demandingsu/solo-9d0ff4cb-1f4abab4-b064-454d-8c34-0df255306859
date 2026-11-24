@@ -6,7 +6,7 @@ import os
 import sqlite3
 from contextlib import contextmanager
 from datetime import date
-from typing import Iterator, List, Optional, Sequence
+from typing import Dict, Iterator, List, Optional, Sequence
 
 from .validation import RuleRecord
 
@@ -33,6 +33,17 @@ CREATE TABLE IF NOT EXISTS submissions (
     rule_codes  TEXT NOT NULL,
     conflict    TEXT,
     created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- Exact, ordered rule membership of every newly submitted batch.  Batches
+-- stored before this table existed have no rows here; their membership is
+-- rebuilt from the retained comma-joined text in submissions.rule_codes
+-- together with the item's in-stock rules (see app/history.py).
+CREATE TABLE IF NOT EXISTS submission_rules (
+    submission_id INTEGER NOT NULL REFERENCES submissions (id),
+    position      INTEGER NOT NULL,
+    rule_code     TEXT NOT NULL,
+    PRIMARY KEY (submission_id, position)
 );
 """
 
@@ -108,6 +119,30 @@ def immediate_transaction(conn: sqlite3.Connection) -> Iterator[sqlite3.Connecti
         conn.execute("COMMIT")
 
 
+@contextmanager
+def read_snapshot(conn: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
+    """Run a group of reads inside one deferred transaction.
+
+    The connection is otherwise in autocommit mode, so every bare SELECT would
+    be its own transaction and consecutive statements could observe different
+    committed states.  Wrapping the reads in a single transaction makes the
+    whole batch-history query (submissions + rules + membership rows) see one
+    committed snapshot, even while a concurrent submission is committing
+    (WAL readers never block the writer).
+    """
+    conn.execute("BEGIN")
+    try:
+        yield conn
+    except BaseException:
+        try:
+            conn.execute("ROLLBACK")
+        except sqlite3.Error:
+            pass
+        raise
+    else:
+        conn.execute("COMMIT")
+
+
 def _row_to_record(row: sqlite3.Row) -> RuleRecord:
     return RuleRecord(
         rule_code=row["rule_code"],
@@ -166,6 +201,82 @@ def insert_submission(conn: sqlite3.Connection, item_code: str, status: str,
         (item_code, status, ",".join(rule_codes), conflict_json),
     )
     return int(cur.lastrowid)
+
+
+def insert_submission_rules(conn: sqlite3.Connection, submission_id: int,
+                            rule_codes: Sequence[str]) -> None:
+    """Store the exact rule codes of a batch in submission order.
+
+    This is the authoritative membership record for new batches; the
+    comma-joined ``submissions.rule_codes`` text is kept only as the retained
+    original text (audit / legacy fallback).
+    """
+    conn.executemany(
+        "INSERT INTO submission_rules (submission_id, position, rule_code) "
+        "VALUES (?, ?, ?)",
+        [(submission_id, position, code)
+         for position, code in enumerate(rule_codes)],
+    )
+
+
+def get_submission_rule_map(conn: sqlite3.Connection,
+                            submission_ids: Sequence[int]) -> Dict[int, List[str]]:
+    """Exact ordered rule codes for the given submissions (new-format batches)."""
+    if not submission_ids:
+        return {}
+    placeholders = ",".join("?" for _ in submission_ids)
+    rows = conn.execute(
+        f"""
+        SELECT submission_id, rule_code FROM submission_rules
+        WHERE submission_id IN ({placeholders})
+        ORDER BY submission_id, position
+        """,
+        list(submission_ids),
+    ).fetchall()
+    result: Dict[int, List[str]] = {}
+    for row in rows:
+        result.setdefault(row["submission_id"], []).append(row["rule_code"])
+    return result
+
+
+def list_submissions_for_items(conn: sqlite3.Connection,
+                               item_codes: Sequence[str]) -> List[sqlite3.Row]:
+    """All submissions of the given items, oldest first (no limit).
+
+    Reconstructing legacy batches requires the complete accepted history of an
+    item, not just the most recent page.
+    """
+    if not item_codes:
+        return []
+    placeholders = ",".join("?" for _ in item_codes)
+    return conn.execute(
+        f"""
+        SELECT * FROM submissions
+        WHERE item_code IN ({placeholders})
+        ORDER BY id
+        """,
+        list(item_codes),
+    ).fetchall()
+
+
+def get_rule_codes_for_items(conn: sqlite3.Connection,
+                             item_codes: Sequence[str]) -> Dict[str, List[str]]:
+    """In-stock rule codes grouped by item."""
+    if not item_codes:
+        return {}
+    placeholders = ",".join("?" for _ in item_codes)
+    rows = conn.execute(
+        f"""
+        SELECT item_code, rule_code FROM rules
+        WHERE item_code IN ({placeholders})
+        ORDER BY rule_code
+        """,
+        list(item_codes),
+    ).fetchall()
+    result: Dict[str, List[str]] = {}
+    for row in rows:
+        result.setdefault(row["item_code"], []).append(row["rule_code"])
+    return result
 
 
 def list_submissions(conn: sqlite3.Connection,
